@@ -12,16 +12,17 @@ namespace Mongo.Repository;
 public abstract class MongoRepositoryBase<Model, Filter, Update> where Filter : FilterBase
 {
     protected internal readonly IMongoCollection<Model> collection;
-
+    protected internal readonly IMongoDatabase database;
     private readonly IHostApplicationLifetime lifetime;
     protected MongoRepositoryBase(
         IMongoClient client,
-        string database,
+        string databaseName,
         string collectionName,
         IHostApplicationLifetime lifetime)
     {
         CheckIsIdFieldExists();
-        collection = client.GetDatabase(database).GetCollection<Model>(collectionName);
+        database = client.GetDatabase(databaseName);
+        collection = database.GetCollection<Model>(collectionName);
         this.lifetime = lifetime;
     }
 
@@ -31,9 +32,18 @@ public abstract class MongoRepositoryBase<Model, Filter, Update> where Filter : 
         return collection.Find(fd).AnyAsync();
     }
 
-    public async Task<Model> FindByIdAsync<T>(T id)
+    public async Task<List<Model>> FindAsync(Filter filter)
     {
-        var fd = Builders<Model>.Filter.Eq("id", id);
+        var ff = collection.Find(CreateCombinedFilter(filter));
+        if (filter.sort != null)
+            ff = ff.Sort(CreateSortDefinition(filter.sort));
+        return await ff.ToListAsync(lifetime.ApplicationStopping);
+    }
+
+    public async Task<Model> FindByIdAsync<T>(T id, Expression<Func<Model, object>>? idTarget = null) where T : notnull
+    {
+        var filter = Builders<Model>.Filter;
+        var fd = idTarget != null ? filter.Eq(idTarget, id) : filter.Eq("id", id);
         return await collection.Find(fd).FirstOrDefaultAsync();
     }
 
@@ -53,7 +63,22 @@ public abstract class MongoRepositoryBase<Model, Filter, Update> where Filter : 
             throw;
         }
     }
+    protected internal IAggregateFluent<Model> Aggregate(Filter filter)
+    {
+        var fd = CreateCombinedFilter(filter);
+        var af = collection.Aggregate()
+            .Match(fd);
+        if (filter.sort != null)
+            af = af.Sort(CreateSortDefinition(filter.sort));
 
+        return af;
+    }
+
+    protected internal (IAggregateFluent<Model>, Task<AggregateCountResult>) AggregateWithPagination(Filter filter)
+    {
+        var af = Aggregate(filter);
+        return (af.Skip((filter.pageIndex - 1) * filter.pageSize).Limit(filter.pageSize), af.Count().FirstAsync());
+    }
     protected internal async Task<DeleteResult> DeleteManyAsync(Filter filter)
     {
         var fd = CreateCombinedFilter(filter);
@@ -65,15 +90,6 @@ public abstract class MongoRepositoryBase<Model, Filter, Update> where Filter : 
         var fd = CreateCombinedFilter(filter);
         return await collection.FindOneAndDeleteAsync(fd, cancellationToken: lifetime.ApplicationStopping);
     }
-
-    protected internal async Task<List<Model>> FindAsync(Filter filter)
-    {
-        var ff = collection.Find(CreateCombinedFilter(filter));
-        if (filter.sort != null)
-            ff = ff.Sort(CreateSortDefinition(filter.sort));
-        return await ff.ToListAsync(lifetime.ApplicationStopping);
-    }
-
     protected internal async Task<List<TProjection>> FindAsync<TProjection>(
         Filter filter, Expression<Func<Model, TProjection>> project)
     {
@@ -115,6 +131,17 @@ public abstract class MongoRepositoryBase<Model, Filter, Update> where Filter : 
     {
         await collection.InsertManyAsync(models, cancellationToken: lifetime.ApplicationStopping);
     }
+    protected internal IAggregateFluent<TResult> Lookup<TBase, TForeign, TResult>(
+        IAggregateFluent<TBase> af,
+        string foreignCollection,
+        Expression<Func<TBase, object>> localField,
+        Expression<Func<TForeign, object>> foreignField,
+        Expression<Func<TResult, object>> @as)
+    {
+        return af.Lookup(database.GetCollection<TForeign>(foreignCollection), localField, foreignField, @as)
+            .Unwind<TResult, TBase>(@as)
+            .Project<TResult>(Builders<TBase>.Projection.Exclude(localField));
+    }
 
     protected internal async Task<Model> ReplaceAsync(Filter filter, Model model, bool isUpsert)
     {
@@ -140,6 +167,11 @@ public abstract class MongoRepositoryBase<Model, Filter, Update> where Filter : 
         using var cursor = await ff.Project(project).ToCursorAsync();
         while (await cursor.MoveNextAsync()) yield return cursor.Current;
     }
+    protected internal async Task<PaginationResult<TResult>> ToPaginationAsync<TResult>(
+        IAggregateFluent<TResult> af, Filter filter, Task<AggregateCountResult> tdTask)
+    {
+        return new(await af.ToListAsync(), new(filter.pageIndex, filter.pageSize, (await tdTask).Count));
+    }
     protected internal async Task<UpdateResult> UpdateManyAsync(Filter filter, Update update, bool isUpsert)
     {
         var fd = CreateCombinedFilter(filter);
@@ -147,11 +179,12 @@ public abstract class MongoRepositoryBase<Model, Filter, Update> where Filter : 
         var ur = await collection.UpdateManyAsync(fd, ud, new() { IsUpsert = isUpsert }, lifetime.ApplicationStopping);
         return ur;
     }
-    protected internal async Task<UpdateResult> UpdateOneAsync(Filter filter, Update update)
+    protected internal async Task<UpdateResult> UpdateOneAsync(Filter filter, Update update, bool isUpsert = false)
     {
         var fd = CreateCombinedFilter(filter);
         var ud = CreateUpdateDefinition(update);
-        var ur = await collection.UpdateOneAsync(fd, ud, cancellationToken: lifetime.ApplicationStopping);
+        var ur = await collection.UpdateOneAsync(
+            fd, ud, options: new() { IsUpsert = isUpsert }, cancellationToken: lifetime.ApplicationStopping);
         return ur;
     }
 
